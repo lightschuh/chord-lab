@@ -398,23 +398,51 @@ function box(v,opt){
 }
 
 // ---------- audio ----------
-let actx=null;const bufCache={};
-function ensureAudio(){if(!actx){const C=window.AudioContext||window.webkitAudioContext;if(!C)return null;actx=new C()}if(actx.state==='suspended')actx.resume();return actx}
-function ks(midi){
-  if(bufCache[midi])return bufCache[midi];
-  const sr=actx.sampleRate,f=440*Math.pow(2,(midi-69)/12),N=Math.max(2,Math.round(sr/f)),len=Math.floor(sr*2.4);
-  const buf=actx.createBuffer(1,len,sr),d=buf.getChannelData(0),ring=new Float32Array(N);
+// Chords are rendered to WAV and played through <audio> elements, which iPhone plays
+// like music (the ring/silent switch does not mute them).
+const SR=22050;const wavCache={};
+function ksInto(out,midi,offset,gain){
+  const f=440*Math.pow(2,(midi-69)/12),N=Math.max(2,Math.round(SR/f)),ring=new Float32Array(N);
   for(let i=0;i<N;i++)ring[i]=Math.random()*2-1;
-  let idx=0;const decay=0.996-(midi-40)*0.00004;
-  for(let i=0;i<len;i++){const a=ring[idx],b=ring[(idx+1)%N];d[i]=a;ring[idx]=(a+b)*0.5*decay;idx=(idx+1)%N}
-  return bufCache[midi]=buf;
+  let idx=0;const decay=0.994-(midi-40)*0.00006;
+  for(let i=offset;i<out.length;i++){const a=ring[idx],b=ring[(idx+1)%N];out[i]+=a*gain;ring[idx]=(a+b)*0.5*decay;idx=(idx+1)%N}
 }
-function strum(v){
-  const c=ensureAudio();if(!c)return;const t0=c.currentTime+0.03;let k=0;
-  const lp=c.createBiquadFilter();lp.type='lowpass';lp.frequency.value=2600;lp.connect(c.destination);
-  v.fr.forEach((f,i)=>{if(f==null)return;const src=c.createBufferSource();src.buffer=ks(OPENMIDI[i]+f);const g=c.createGain();g.gain.value=0.2;src.connect(g);g.connect(lp);src.start(t0+(k++)*0.035)});
+function toWavUrl(data){
+  let peak=0;for(const x of data)peak=Math.max(peak,Math.abs(x));const k=peak>0?0.85/peak:1;
+  const n=data.length,buf=new ArrayBuffer(44+n*2),dv=new DataView(buf);
+  const ws=(o,s)=>{for(let i=0;i<s.length;i++)dv.setUint8(o+i,s.charCodeAt(i))};
+  ws(0,'RIFF');dv.setUint32(4,36+n*2,true);ws(8,'WAVE');ws(12,'fmt ');dv.setUint32(16,16,true);dv.setUint16(20,1,true);dv.setUint16(22,1,true);
+  dv.setUint32(24,SR,true);dv.setUint32(28,SR*2,true);dv.setUint16(32,2,true);dv.setUint16(34,16,true);ws(36,'data');dv.setUint32(40,n*2,true);
+  let lp=0;for(let i=0;i<n;i++){lp+=0.45*(data[i]-lp);dv.setInt16(44+i*2,Math.max(-32767,Math.min(32767,lp*k*32767)),true)}
+  return URL.createObjectURL(new Blob([buf],{type:'audio/wav'}));
 }
-function click(accent){const c=ensureAudio();if(!c)return;const o=c.createOscillator(),g=c.createGain();o.frequency.value=accent?1500:1000;g.gain.setValueAtTime(0.12,c.currentTime);g.gain.exponentialRampToValueAtTime(0.0001,c.currentTime+0.05);o.connect(g);g.connect(c.destination);o.start();o.stop(c.currentTime+0.06)}
+function chordUrl(v){
+  const key=v.fr.join(',');if(wavCache[key])return wavCache[key];
+  const out=new Float32Array(Math.floor(SR*2.2));let k=0;
+  v.fr.forEach((f,i)=>{if(f==null)return;ksInto(out,OPENMIDI[i]+f,Math.floor((k++)*0.035*SR),1)});
+  // short fade at the end
+  for(let i=0;i<2000;i++)out[out.length-1-i]*=i/2000;
+  return wavCache[key]=toWavUrl(out);
+}
+function clickUrl(freq){const n=Math.floor(SR*0.06),out=new Float32Array(n);for(let i=0;i<n;i++)out[i]=Math.sin(2*Math.PI*freq*i/SR)*Math.exp(-i/(SR*0.012));return toWavUrl(out)}
+let aPool=null,poolIdx=0,clicks=null,clickIdx=0;
+const SILENT='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+function ensureAudio(){
+  try{if(navigator.audioSession)navigator.audioSession.type='playback'}catch(e){}
+  if(aPool)return true;
+  const mk=src=>{const a=new Audio(src);a.preload='auto';a.setAttribute('playsinline','');return a};
+  aPool=[0,1,2,3].map(()=>mk(SILENT));
+  const hi=clickUrl(1500),lo=clickUrl(1000);
+  clicks={hi:[mk(hi),mk(hi)],lo:[mk(lo),mk(lo),mk(lo)]};
+  // unlock every element inside this tap so later plays (metronome) are allowed
+  [...aPool,...clicks.hi,...clicks.lo].forEach(a=>{try{const v0=a.volume;a.muted=true;const p=a.play();const done=()=>{try{a.pause();a.currentTime=0;a.muted=false;a.volume=v0}catch(e){}};if(p&&p.then)p.then(done).catch(()=>{a.muted=false});else done()}catch(e){}});
+  return true;
+}
+function playEl(a,src){try{if(src&&a.src!==src)a.src=src;a.currentTime=0;a.muted=false;const p=a.play();if(p&&p.catch)p.catch(()=>{})}catch(e){}}
+function strum(v){ensureAudio();const a=aPool[poolIdx++%aPool.length];playEl(a,chordUrl(v))}
+function click(accent){if(!clicks)return;const arr=accent?clicks.hi:clicks.lo;const a=arr[clickIdx++%arr.length];a.volume=0.6;playEl(a)}
+document.addEventListener('touchend',()=>ensureAudio(),{passive:true,once:true});
+document.addEventListener('click',()=>ensureAudio(),{once:true});
 
 // ---------- storage ----------
 let learned={};try{learned=JSON.parse(localStorage.getItem('baker-p9-learned')||'{}')}catch(e){}
